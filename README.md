@@ -13,3 +13,9 @@ Nokogiri is required because we need to parse DOM in order to get these lists an
 2. gem install open-uri
 3. gem install selenium-webdriver
 4. gem install uri
+5. gem install phantomjs
+6. gem install text
+
+
+# Brew installs
+1. brew install phantomjs
