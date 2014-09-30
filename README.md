@@ -15,6 +15,8 @@ Nokogiri is required because we need to parse DOM in order to get these lists an
 4. gem install uri
 5. gem install phantomjs
 6. gem install text
+7. gem install timeout
+
 
 
 # Brew installs

@@ -8,20 +8,34 @@ require 'net/http'
 require "selenium-webdriver"
 require 'csv'
 require 'text'
+require 'timeout'
 
 IPHONE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 7_0 like Mac OS X; en-us) AppleWebKit/537.51.1 (KHTML, like Gecko) Version/7.0 Mobile/11A465 Safari/9537.53'
 
 class Domium
+  attr_accessor :url, :from_best, :client_redirect, :server_redirect, :responsive, :responsive_delivery, :google_ad, :rank, :category
 
-  def initialize(sites=[])
-    
+  def initialize(url="", from_best=true)
+    @url                 = url
+    @from_best           = from_best
+    @client_redirect     = false
+    @server_redirect     = false
+    @responsive          = false
+    @responsive_delivery = false
+    @google_ad           = false
+    @rank                = 0
+    @category            = "None"
   end
 
-  def make_5000_best_page_url(page_number)
+  def redirects?
+    return (@client_redirect || @server_redirect)
+  end
+
+  def self.make_5000_best_page_url(page_number)
     "http://5000best.com/?w.c&xml=1&ta=32&p=#{page_number}&sortby=0&ise=&h=03"
   end
 
-  def parse_best_page(page_number)
+  def self.parse_best_page(page_number)
     page_url = self.make_5000_best_page_url page_number
 
     page = Nokogiri::HTML(open(page_url, :read_timeout=>5*60))
@@ -44,7 +58,7 @@ class Domium
     return sites
   end
 
-  def parse_best_pages(range=1..50)
+  def self.parse_best_pages(range=1..50)
     sites = []
     range.each do |i|
       sites += self.parse_best_page i
@@ -52,55 +66,82 @@ class Domium
     sites 
   end
 
-  def is_mobile?(url_query)
-    url    = URI.parse(url_query)
-    response = get_mobile_response_for(url)
-    page = Nokogiri::HTML(response.body)
+  def is_mobile?
+    url_query = self.url
+    url       = URI.parse(url_query)
+    response  = get_mobile_response_for(url)
+    puts "Url is: #{url_query}"
 
-    redirects = false
-    redirects = self.has_serverside_mobile_redirect? response
-    unless redirects
-      cs_redirects = self.has_clientside_modile_redirect? url
-    end
+    # puts response
+    if response
+      if response['Location']
+        # puts "Location: #{response['Location']}"
+        # puts "Origin:   #{url_query}"
+        # puts "Dist:     #{Text::Levenshtein.distance(response['Location'], url_query)}"
+        if (Text::Levenshtein.distance(response['Location'], url_query) == 1)
+          # going to https://
+          @url = response['Location']
+          response = get_mobile_response_for URI.parse(@url)
+          return false unless response
 
-    mobile_redirect = (redirects || cs_redirects)
-
-    responsive = false
-    responsive_delivery = false
-    unless mobile_redirect
-      responsive = self.is_responsive? response, url_query, page
-      unless responsive
-        responsive_delivery = has_responsive_delivery? url_query
+        end
       end
-    end
 
-    # puts "\n URL: #{url_query}\n mobile_redirect: #{(redirects || cs_redirects)}\n responsive: #{responsive}"
-    return { mobile_redirect: mobile_redirect, 
-             responsive: responsive, 
-             responsive_delivery: responsive_delivery
-           }
+      page = Nokogiri::HTML(response.body)
+
+      redirects = false
+      redirects = self.has_serverside_mobile_redirect? response
+      unless redirects
+        cs_redirects = self.has_clientside_modile_redirect? url
+      end
+
+      mobile_redirect = (redirects || cs_redirects)
+
+      responsive          = false
+      responsive_delivery = false
+      unless mobile_redirect
+        responsive = self.is_responsive? response, url_query, page
+        unless responsive
+          responsive_delivery = has_responsive_delivery?
+        end
+      end
+
+
+
+      @client_redirect     = cs_redirects
+      @server_redirect     = redirects
+      @responsive          = responsive
+      @responsive_delivery = responsive_delivery
+
+      # puts "\n URL: #{url_query}\n mobile_redirect: #{(redirects || cs_redirects)}\n responsive: #{responsive}"
+      return mobile_redirect || responsive || responsive_delivery
+    end
   end
 
-  def has_ad?(url_query)
+  def has_ad?
+    url_query     = self.url
     url           = URI.parse(url_query)
     response      = get_mobile_response_for(url)
-    page          = Nokogiri::HTML(response.body)
-    adwords       = page.xpath("//script[not(@src)]")
-    has_google_ad = false
+    if response
+      page          = Nokogiri::HTML(response.body)
+      adwords       = page.xpath("//script[not(@src)]")
+      has_google_ad = false
 
-    adwords.each do |ad|
-      if(ad.text.include?('google_ad') || ad.text.include?('google_conversion'))
-        has_google_ad = true
-        break
+      adwords.each do |ad|
+        if(ad.text.include?('google_ad') || ad.text.include?('google_conversion'))
+          has_google_ad = true
+          break
+        end
       end
-    end
 
-    google_ad_script = page.xpath("//script[contains(@src, 'googlead')]")
+      google_ad_script = page.xpath("//script[contains(@src, 'googlead')]")
 
-    if google_ad_script.length > 0
-      has_google_ad = true
+      if google_ad_script.length > 0
+        has_google_ad = true
+      end
+      self.google_ad = has_google_ad
+      return has_google_ad
     end
-    return {has_google_ad: has_google_ad}
   end
 
   def is_mobile_url?(url)
@@ -131,16 +172,27 @@ class Domium
     end
   end
 
-  def has_responsive_delivery?(url_query)
+  def has_responsive_delivery?
+    url_query        = self.url
     url              = URI.parse(url_query)
     response         = get_mobile_response_for  url
     desktop_response = get_desktop_response_for url
 
+    # File.open("output/mobile.html", "w+"){|file| file << response.body}
+    # File.open("output/desktop.html", "w+"){|file| file << desktop_response.body}
     white = Text::WhiteSimilarity.new
-
-    sim = white.similarity response.body, desktop_response.body
-    puts "similarity is: #{sim}"
-    if sim < 0.8
+    sim = 1.0
+    begin
+      Timeout::timeout(20) do
+        sim = white.similarity response.body, desktop_response.body    
+      end
+    rescue Timeout::Error
+      puts "took too long..."
+      sim = 0.0
+    end
+    puts ""
+    puts "Sim is: #{sim} for #{@url}"
+    if sim < 0.8 || sim.nan?
       responsive_delivery = true
     else
       responsive_delivery = false
@@ -161,12 +213,24 @@ class Domium
       response = http.request(req)
       return response
 
+    rescue Zlib::DataError
+      puts "there was a huge error"
+      return false
+    rescue Errno::ECONNREFUSED
+      puts "connection was refused"
+      return false
     rescue
-      url.scheme = "https"
-      http = Net::HTTP.new(url.host, url.port)
-      http.use_ssl = true
-      response = http.request(req)
-      return response
+      begin
+        url.scheme = "https"
+        http = Net::HTTP.new(url.host, url.port)
+        http.use_ssl = true
+        # http.ssl_version = :SSLv3
+        response = http.request(req)
+        return response
+      rescue 
+        puts "SSL ERROR! :'("
+        return false
+      end
     end
   end
 
@@ -174,7 +238,33 @@ class Domium
     path   = url.path
     path ||= "/"
     req = Net::HTTP::Get.new(path, {'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/37.0.2062.124 Safari/537.36'})
-    response = Net::HTTP.start( url.host, url.port ) { |http| http.request( req ) }
+    # puts "Url is: #{url}"
+    begin
+      http = Net::HTTP.new(url.host, url.port)
+      http.use_ssl = (url.scheme == "https")
+      response = http.request(req)
+      return response
+
+    rescue Zlib::DataError
+      puts "there was a huge error"
+      return false
+    rescue Errno::ECONNREFUSED
+      puts "connection was refused"
+      return false
+    rescue
+      begin
+        url.scheme = "https"
+        http = Net::HTTP.new(url.host, url.port)
+        http.use_ssl = true
+        # http.ssl_version = :SSLv3
+        response = http.request(req)
+        return response
+      rescue 
+        puts "SSL ERROR! :'("
+        return false
+      end
+    end
+    # response = Net::HTTP.start( url.host, url.port ) { |http| http.request( req ) }
     return response
   end
 
@@ -193,43 +283,48 @@ class Domium
           to_check.prepend(url_query)
         end
 
-        url = URI.parse(to_check)
+        begin
+          url        = URI.parse(to_check)
+          response   = get_mobile_response_for(url)
+          responsive = response.body.include? '@media' if response.body.include? '@media'            
+        rescue 
+          responsive = false
+        end
         
-        response = get_mobile_response_for(url)
-        responsive = response.body.include? '@media' if response.body.include? '@media'  
         return true if responsive
       end
     end
     return responsive
   end
 
-  def to_csv_string(range=1..50)
-    sites = parse_best_pages(range)
-    has_inserted_keys = false
-
-    generated_csv = ""
-    sites.each do |site|
-      testing_url = site[:url]
-      puts "testing_url='#{testing_url}'"
-      site.merge!(self.is_mobile? testing_url)
-      site.merge!(self.has_ad?    testing_url)
-      unless has_inserted_keys
-        has_inserted_keys = true
-        generated_csv += site.keys.to_csv
-      end
-      puts "site=#{site}"
-      puts "csv=#{generated_csv}"
-      generated_csv += site.values.to_csv
-    end
-    puts generated_csv
-    return generated_csv
+  def self.headers
+    %w(rank category url is_mobilized mobile_redirect responsive responsive_delivery has_google_ad)
   end
 
-  def to_csv(range=1..50, filename="processed_file.csv")
-    generated_csv = self.to_csv_string(range)
-    new_csv = File.open("output/#{filename}", "w+") { |file|
-      file << generated_csv
+  def values
+    [@rank, @category, @url, (@server_redirect || @client_redirect || @responsive || @responsive_delivery), (@server_redirect || @client_redirect), @responsive, @responsive_delivery, @google_ad]
+  end
+
+  def to_csv_string(headers=false)
+    return self.values.to_csv
+  end
+
+  def self.to_csv(range=1..50, filename="processed_file.csv")
+    File.open("output/#{filename}", "w+") { |file|
+      file << self.headers.to_csv
     }
+    range.each do |page_no|
+      page = Domium.parse_best_page(page_no)
+      page.each do |site|
+        compiled_page = Domium.new site[:url]
+        compiled_page.rank       = site[:rank]
+        compiled_page.category   = site[:category]
+        compiled_page.is_mobile?
+        compiled_page.has_ad?
+        File.open("output/#{filename}", "a") { |file|
+          file << compiled_page.to_csv_string
+        }
+      end
+    end
   end
-
 end
